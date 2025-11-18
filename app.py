@@ -1,293 +1,240 @@
 import os
 import datetime as dt
-import pandas as pd
-import plotly.express as px
 import streamlit as st
+import psycopg2
+import pandas as pd
+from pymongo import MongoClient
 from dotenv import load_dotenv
 
-from sqlalchemy import create_engine, text
-from pymongo import MongoClient
-
+# Load environment variables
 load_dotenv()
 
-#Postgres schema helper
-PG_SCHEMA = os.getenv("PG_SCHEMA", "public")   # CHANGE: "public" to your own schema name
-def qualify(sql: str) -> str:
-    # Replace occurrences of {S}.<table> with <schema>.<table>
-    return sql.replace("{S}.", f"{PG_SCHEMA}.")
-
-# CONFIG: Postgres and Mongo Queries
-    # 修改PostgreSQL查询部分（仅展示调整的关键查询）
-CONFIG = {
+# ===== Database connection configuration =====
+DB_CONFIG = {
     "postgres": {
-        "enabled": True,
-        "uri": os.getenv("PG_URI", "postgresql+psycopg2://postgres:password@localhost:5432/eldercare_db"),
-        "queries": {
-            # 医生角色：调整患者ID范围（假设实际数据doctor_id为1-5）
-            "Doctor: patients under my care (table)": {
-                "sql": """
-                    SELECT p.patient_id, p.name AS patient, p.age, p.room_no
-                    FROM {S}.patients p
-                    WHERE p.doctor_id = :doctor_id 
-                      AND p.patient_id <= 100  # 限制在500条数据的患者ID范围内
-                    ORDER BY p.name;
-                """,
-                "chart": {"type": "table"},
-                "tags": ["doctor"],
-                "params": ["doctor_id"]
-            },
-            
-            # 护士角色：调整今日任务查询（假设数据中treatment_time有近7天记录）
-            "Nurse: today’s tasks (treatments to administer) (table)": {
-                "sql": """
-                    SELECT p.name AS patient, t.treatment_type, t.treatment_time
-                    FROM {S}.treatments t
-                    JOIN {S}.patients p ON t.patient_id = p.patient_id
-                    WHERE t.nurse_id = :nurse_id
-                      AND t.treatment_time::date BETWEEN CURRENT_DATE - INTERVAL '7 days' AND CURRENT_DATE  # 扩大时间范围避免空结果
-                    ORDER BY t.treatment_time;
-                """,
-                "chart": {"type": "table"},
-                "tags": ["nurse"],
-                "params": ["nurse_id"]
-            },
-            
-            # 药剂师角色：调整药品库存阈值（适配500条数据中的库存规模）
-            "Pharmacist: medicines to reorder (bar)": {
-                "sql": """
-                    SELECT m.name, m.quantity
-                    FROM {S}.medicine_stock m
-                    WHERE m.quantity < :reorder_threshold  # 假设实际库存多为10-50，阈值设为15
-                    ORDER BY m.quantity ASC;
-                """,
-                "chart": {"type": "bar", "x": "name", "y": "quantity"},
-                "tags": ["pharmacist"],
-                "params": ["reorder_threshold"]
-            },
-            
-            # 管理者角色：简化患者统计（适配小数据量）
-            "Mgr: total patients & average age (table)": {
-                "sql": """
-                    SELECT COUNT(*)::int AS total_patients, 
-                           AVG(age)::numeric(10,1) AS avg_age,
-                           MIN(age) AS min_age,  # 新增小数据量下更有意义的统计
-                           MAX(age) AS max_age
-                    FROM {S}.patients;
-                """,
-                "chart": {"type": "table"},
-                "tags": ["manager"]
-            }
-            # 其他查询保持结构，根据实际表字段名微调（如实际字段名不同需同步修改）
-        }
-    
-    # ... 其他配置保持不变
-},
-
-
+        "uri": os.getenv("PG_URI", "postgresql+psycopg2://postgres:password@localhost:5432/gym_db"),
+        "schema": os.getenv("PG_SCHEMA", "public")
+    },
     "mongo": {
-    "enabled": True,
-    "uri": os.getenv("MONGO_URI", "mongodb://localhost:27017"),
-    "db_name": os.getenv("MONGO_DB", "eldercare_telemetry"),
-    "queries": {
-        # 调整心率查询的时间范围（适配小数据量）
-        "TS: Hourly avg heart rate (resident 501, last 24h)": {
-            "collection": "bracelet_readings_ts",
-            "aggregate": [
-                {"$match": {
-                    "meta.resident_id": 501,  # 假设500条数据中存在resident_id=501的记录
-                    "ts": {"$gte": dt.datetime.utcnow() - dt.timedelta(hours=48)}  # 扩大时间范围
-                }},
-                {"$project": {
-                    "hour": {"$dateTrunc": {"date": "$ts", "unit": "hour"}},
-                    "hr": "$heart_rate_bpm"
-                }},
-                {"$group": {"_id": "$hour", "avg_hr": {"$avg": "$hr"}, "n": {"$count": {}}}},
-                {"$sort": {"_id": 1}}
-            ],
-            "chart": {"type": "line", "x": "_id", "y": "avg_hr"}
-        },
-        
-        # 调整设备电池状态查询（适配少量设备数据）
-        "Telemetry: Battery status distribution": {
-            "collection": "bracelet_data",
-            "aggregate": [
-                {"$project": {
-                    "battery": {"$ifNull": ["$battery_pct", None]},
-                    "bucket": {
-                        "$switch": {
-                            "branches": [
-                                {"case": {"$gte": ["$battery_pct", 60]}, "then": "60+"},  # 简化分桶（数据量少）
-                                {"case": {"$gte": ["$battery_pct", 30]}, "then": "30-59"},
-                            ],
-                            "default": "<30 or null"
-                        }
-                    }
-                }},
-                {"$group": {"_id": "$bucket", "cnt": {"$count": {}}}},
-                {"$sort": {"cnt": -1}}
-            ],
-            "chart": {"type": "pie", "names": "_id", "values": "cnt"}
-        }
-        # 其他Mongo查询类似调整
+        "uri": os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+        "db_name": os.getenv("MONGO_DB", "gym_telemetry")
     }
 }
 
-}
+# ===== Page configuration =====
+st.set_page_config(page_title="Smart Gym Dashboard", layout="wide")
+st.title("📊 Smart Gym Operation Dashboard")
 
-# The following block of code will create a simple Streamlit dashboard page
-st.set_page_config(page_title="Old-Age Home DB Dashboard", layout="wide")
-st.title("Old-Age Home | Mini Dashboard (Postgres + MongoDB)")
 
-def metric_row(metrics: dict):
-    cols = st.columns(len(metrics))
-    for (k, v), c in zip(metrics.items(), cols):
-        c.metric(k, v)
-
+# ===== Database connection functions =====
 @st.cache_resource
-def get_pg_engine(uri: str):
-    return create_engine(uri, pool_pre_ping=True, future=True)
-
-@st.cache_data(ttl=60)
-def run_pg_query(_engine, sql: str, params: dict | None = None):
-    with _engine.connect() as conn:
-        return pd.read_sql(text(sql), conn, params=params or {})
-
-@st.cache_resource
-def get_mongo_client(uri: str):
-    return MongoClient(uri)
-
-def mongo_overview(client: MongoClient, db_name: str):
-    info = client.server_info()
-    db = client[db_name]
-    colls = db.list_collection_names()
-    stats = db.command("dbstats")
-    total_docs = sum(db[c].estimated_document_count() for c in colls) if colls else 0
-    return {
-        "DB": db_name,
-        "Collections": f"{len(colls):,}",
-        "Total docs (est.)": f"{total_docs:,}",
-        "Storage": f"{round(stats.get('storageSize',0)/1024/1024,1)} MB",
-        "Version": info.get("version", "unknown")
-    }
-
-@st.cache_data(ttl=60)
-def run_mongo_aggregate(_client, db_name: str, coll: str, stages: list):
-    db = _client[db_name]
-    docs = list(db[coll].aggregate(stages, allowDiskUse=True))
-    return pd.json_normalize(docs) if docs else pd.DataFrame()
-
-def render_chart(df: pd.DataFrame, spec: dict):
-    if df.empty:
-        st.info("No rows.")
-        return
-    ctype = spec.get("type", "table")
-    # light datetime parsing for x axes
-    for c in df.columns:
-        if df[c].dtype == "object":
-            try:
-                df[c] = pd.to_datetime(df[c])
-            except Exception:
-                pass
-
-    if ctype == "table":
-        st.dataframe(df, use_container_width=True)
-    elif ctype == "line":
-        st.plotly_chart(px.line(df, x=spec["x"], y=spec["y"]), use_container_width=True)
-    elif ctype == "bar":
-        st.plotly_chart(px.bar(df, x=spec["x"], y=spec["y"]), use_container_width=True)
-    elif ctype == "pie":
-        st.plotly_chart(px.pie(df, names=spec["names"], values=spec["values"]), use_container_width=True)
-    elif ctype == "heatmap":
-        pivot = pd.pivot_table(df, index=spec["rows"], columns=spec["cols"], values=spec["values"], aggfunc="mean")
-        st.plotly_chart(px.imshow(pivot, aspect="auto", origin="upper",
-                                  labels=dict(x=spec["cols"], y=spec["rows"], color=spec["values"])),
-                        use_container_width=True)
-    elif ctype == "treemap":
-        st.plotly_chart(px.treemap(df, path=spec["path"], values=spec["values"]), use_container_width=True)
-    else:
-        st.dataframe(df, use_container_width=True)
-
-# The following block of code is for the dashboard sidebar, where you can pick your users, provide parameters, etc.
-with st.sidebar:
-    st.header("Connections")
-    # These fields are pre-filled from .env file
-    pg_uri = st.text_input("Postgres URI", CONFIG["postgres"]["uri"])     
-    mongo_uri = st.text_input("Mongo URI", CONFIG["mongo"]["uri"])        
-    mongo_db = st.text_input("Mongo DB name", CONFIG["mongo"]["db_name"]) 
-    st.divider()
-    auto_run = st.checkbox("Auto-run on selection change", value=False, key="auto_run_global")
-
-    st.header("Role & Parameters")
-    role = st.selectbox("User role", ["doctor","nurse","pharmacist","guardian","manager","all"], index=5)
-    doctor_id = st.number_input("doctor_id", min_value=1, value=2, step=1)  # 假设实际医生ID为1-5
-    nurse_id = st.number_input("nurse_id", min_value=1, value=3, step=1)    # 假设实际护士ID为1-10
-    patient_name = st.text_input("patient_name", value="John Doe")  # 改为实际存在的患者姓名
-    age_threshold = st.number_input("age_threshold", min_value=60, value=75, step=1)  # 适配老年患者年龄
-    days = st.slider("last N days", 1, 30, 5)  # 缩小时间范围（数据量少）
-    med_low_threshold = st.number_input("med_low_threshold", min_value=0, value=3, step=1)  # 适配小库存
-    reorder_threshold = st.number_input("reorder_threshold", min_value=0, value=8, step=1)
-    PARAMS_CTX = {
-        "doctor_id": int(doctor_id),
-        "nurse_id": int(nurse_id),
-        "patient_name": patient_name,
-        "age_threshold": int(age_threshold),
-        "days": int(days),
-        "med_low_threshold": int(med_low_threshold),
-        "reorder_threshold": int(reorder_threshold),
-    }
-
-#Postgres part of the dashboard
-st.subheader("Postgres")
-try:
-    
-    eng = get_pg_engine(pg_uri)
-
-    with st.expander("Run Postgres query", expanded=True):
-        # The following will filter queries by role
-        def filter_queries_by_role(qdict: dict, role: str) -> dict:
-            def ok(tags):
-                t = [s.lower() for s in (tags or ["all"])]
-                return "all" in t or role.lower() in t
-            return {name: q for name, q in qdict.items() if ok(q.get("tags"))}
-
-        pg_all = CONFIG["postgres"]["queries"]
-        pg_q = filter_queries_by_role(pg_all, role)
-
-        names = list(pg_q.keys()) or ["(no queries for this role)"]
-        sel = st.selectbox("Choose a saved query", names, key="pg_sel")
-
-        if sel in pg_q:
-            q = pg_q[sel]
-            sql = qualify(q["sql"])   
-            st.code(sql, language="sql")
-
-            run  = auto_run or st.button("▶ Run Postgres", key="pg_run")
-            if run:
-                wanted = q.get("params", [])
-                params = {k: PARAMS_CTX[k] for k in wanted}
-                df = run_pg_query(eng, sql, params=params)
-                render_chart(df, q["chart"])
-        else:
-            st.info("No Postgres queries tagged for this role.")
-except Exception as e:
-    st.error(f"Postgres error: {e}")
-
-# Mongo panel
-if CONFIG["mongo"]["enabled"]:
-    st.subheader("🍃 MongoDB")
+def get_pg_connection():
+    """Create PostgreSQL connection (cached to avoid repeated connections)"""
     try:
-        mongo_client = get_mongo_client(mongo_uri)   
-        metric_row(mongo_overview(mongo_client, mongo_db))
-
-        with st.expander("Run Mongo aggregation", expanded=True):
-            mongo_query_names = list(CONFIG["mongo"]["queries"].keys())
-            selm = st.selectbox("Choose a saved aggregation", mongo_query_names, key="mongo_sel")
-            q = CONFIG["mongo"]["queries"][selm]
-            st.write(f"**Collection:** `{q['collection']}`")
-            st.code(str(q["aggregate"]), language="python")
-            runm = auto_run or st.button("▶ Run Mongo", key="mongo_run")
-            if runm:
-                dfm = run_mongo_aggregate(mongo_client, mongo_db, q["collection"], q["aggregate"])
-                render_chart(dfm, q["chart"])
+        conn = psycopg2.connect(DB_CONFIG["postgres"]["uri"])
+        st.success("✅ PostgreSQL database connected successfully")
+        return conn
     except Exception as e:
-        st.error(f"Mongo error: {e}")
+        st.error(f"❌ PostgreSQL connection failed: {str(e)}")
+        return None
+
+
+@st.cache_resource
+def get_mongo_client():
+    """Create MongoDB connection (for real-time data if needed)"""
+    try:
+        client = MongoClient(DB_CONFIG["mongo"]["uri"])
+        client.admin.command("ping")  # Test connection
+        st.success("✅ MongoDB database connected successfully")
+        return client
+    except Exception as e:
+        st.error(f"❌ MongoDB connection failed: {str(e)}")
+        return None
+
+
+# ===== Core query logic (adapted to 500 records) =====
+def run_pg_query(conn, query, params=None):
+    """Execute PostgreSQL query and return DataFrame"""
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            # Replace schema placeholder {S}
+            query = query.replace("{S}", DB_CONFIG["postgres"]["schema"])
+            cur.execute(query, params or {})
+            columns = [desc[0] for desc in cur.description]
+            data = cur.fetchall()
+            return pd.DataFrame(data, columns=columns)
+    except Exception as e:
+        st.error(f"Query failed: {str(e)}")
+        return None
+
+
+# ===== Dashboard query configuration (role-based) =====
+QUERIES = {
+    "Admin": [
+        # 1. Member statistics (adapted to 150 member records)
+        {
+            "name": "Member Count by Membership Type",
+            "query": """
+                SELECT 
+                    membership_type,
+                    COUNT(*) AS member_count,
+                    ROUND(COUNT(*)*100.0/(SELECT COUNT(*) FROM {S}.member), 1) AS percentage
+                FROM {S}.member
+                GROUP BY membership_type
+                ORDER BY member_count DESC;
+            """,
+            "chart_type": "bar",
+            "x": "membership_type",
+            "y": "member_count"
+        },
+        # 2. Equipment usage rate (adapted to 30 equipment records)
+        {
+            "name": "Fitness Equipment Status Distribution",
+            "query": """
+                SELECT 
+                    status,
+                    COUNT(*) AS equipment_count,
+                    location
+                FROM {S}.fitness_equipment
+                GROUP BY status, location
+                ORDER BY location, status;
+            """,
+            "chart_type": "pie",
+            "names": "status",
+            "values": "equipment_count"
+        }
+    ],
+    "Trainer": [
+        # 1. Personal training statistics (adapted to 100 training records)
+        {
+            "name": "My Scheduled Sessions (Next 7 Days)",
+            "query": """
+                SELECT 
+                    m.name AS member_name,
+                    t.training_date,
+                    t.start_time,
+                    t.end_time,
+                    t.status
+                FROM {S}.personal_training t
+                JOIN {S}.member m ON t.member_id = m.member_id
+                WHERE t.trainer_id = :trainer_id
+                  AND t.training_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+                ORDER BY t.training_date, t.start_time;
+            """,
+            "chart_type": "table",
+            "params": {"trainer_id": 1}  # Default query for trainer ID 1
+        },
+        # 2. Member workout trends (adapted to 500 workout records)
+        {
+            "name": "Member Average Workout Duration (by Equipment Type)",
+            "query": """
+                SELECT 
+                    e.equipment_type,
+                    AVG(w.duration_minutes) AS avg_duration,
+                    COUNT(w.record_id) AS record_count
+                FROM {S}.workout_record w
+                JOIN {S}.fitness_equipment e ON w.equipment_id = e.equipment_id
+                WHERE w.member_id = :member_id
+                GROUP BY e.equipment_type
+                HAVING COUNT(w.record_id) > 0;
+            """,
+            "chart_type": "bar",
+            "x": "equipment_type",
+            "y": "avg_duration",
+            "params": {"member_id": 10}  # Default query for member ID 10
+        }
+    ],
+    "Member": [
+        # 1. Personal workout records (adapted to 500 workout records)
+        {
+            "name": "My Workout History (Last 30 Days)",
+            "query": """
+                SELECT 
+                    e.equipment_name,
+                    w.start_time::date AS workout_date,
+                    w.duration_minutes,
+                    w.calories_burned,
+                    w.heart_rate_avg
+                FROM {S}.workout_record w
+                JOIN {S}.fitness_equipment e ON w.equipment_id = e.equipment_id
+                WHERE w.member_id = :member_id
+                  AND w.start_time >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+                ORDER BY w.start_time DESC;
+            """,
+            "chart_type": "line",
+            "x": "workout_date",
+            "y": "calories_burned",
+            "params": {"member_id": 20}  # Default query for member ID 20
+        },
+        # 2. Personal training history
+        {
+            "name": "My Personal Training Records",
+            "query": """
+                SELECT 
+                    tr.name AS trainer_name,
+                    t.training_date,
+                    t.start_time,
+                    t.status
+                FROM {S}.personal_training t
+                JOIN {S}.trainer tr ON t.trainer_id = tr.trainer_id
+                WHERE t.member_id = :member_id
+                ORDER BY t.training_date DESC;
+            """,
+            "chart_type": "table",
+            "params": {"member_id": 20}
+        }
+    ]
+}
+
+
+# ===== Sidebar parameter configuration (matching actual data range) =====
+with st.sidebar:
+    st.header("👤 Role & Parameters")
+    role = st.selectbox("Select Role", ["Admin", "Trainer", "Member"])
+    
+    # Dynamic parameters (show different parameters based on role)
+    params = {}
+    if role == "Trainer":
+        trainer_id = st.number_input("Trainer ID", min_value=1, max_value=10, value=1, step=1)
+        params["trainer_id"] = trainer_id
+        member_id = st.number_input("Member ID to Query", min_value=1, max_value=150, value=10, step=1)
+        params["member_id"] = member_id
+    elif role == "Member":
+        member_id = st.number_input("My Member ID", min_value=1, max_value=150, value=20, step=1)
+        params["member_id"] = member_id
+    
+    st.divider()
+    st.header("⏱️ Time Range")
+    time_range = st.slider("Query Data for Last N Days", 7, 90, 30)
+
+
+# ===== Execute queries and display results =====
+def main():
+    # Establish database connections
+    pg_conn = get_pg_connection()
+    # mongo_client = get_mongo_client()  # Enable if MongoDB data is needed
+
+    # Display query results for selected role
+    st.subheader(f"📌 {role} Perspective Data")
+    for query_info in QUERIES[role]:
+        with st.expander(f"View {query_info['name']}"):
+            # Execute query
+            df = run_pg_query(pg_conn, query_info["query"], query_info.get("params", params))
+            if df is None or df.empty:
+                st.warning("No data found. Please check if parameter ranges are correct.")
+                continue
+            
+            # Display data and charts
+            st.dataframe(df, use_container_width=True)
+            if query_info["chart_type"] == "bar":
+                st.bar_chart(df, x=query_info["x"], y=query_info["y"])
+            elif query_info["chart_type"] == "line":
+                st.line_chart(df, x=query_info["x"], y=query_info["y"])
+            elif query_info["chart_type"] == "pie":
+                st.pie_chart(df, names=query_info["names"], values=query_info["values"])
+
+
+if __name__ == "__main__":
+    main()
